@@ -1,5 +1,17 @@
-from psycopg import connect
 from contextlib import contextmanager
+
+from psycopg import connect
+
+
+def get_session(return_next=False):
+    with connect("dbname=st3 user=postgres") as conn:
+        _, last_reset, next_reset = conn.execute(
+            """SELECT * FROM sessions WHERE "session" = 'current'"""
+        ).fetchone()
+    session = f"{last_reset}_{next_reset[:10]}"
+    if return_next:
+        return session, next_reset
+    return session
 
 
 @contextmanager
@@ -11,18 +23,8 @@ def _connection(session, conn=None):
             yield conn
 
 
-def get_session(conn=None):
-    with _connection("st3", conn) as conn:
-        _, last_reset, next_reset = conn.execute(
-            """SELECT * FROM sessions WHERE "session" = 'current'"""
-        ).fetchone()
-    session = f"{last_reset}_{next_reset[:10]}"
-    return session
-
-
 def get_token(agent, session, conn=None):
     with _connection(session, conn) as conn:
         return conn.execute(
-            'SELECT "token" FROM agents WHERE "symbol" = %s',
-            (agent,)
+            'SELECT "token" FROM agents WHERE "symbol" = %s', (agent,)
         ).fetchone()[0]

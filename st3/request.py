@@ -1,5 +1,4 @@
 from time import sleep
-from uuid import uuid1
 
 from requests.exceptions import ConnectionError, JSONDecodeError  # noqa
 from requests_ratelimiter import LimiterSession  # noqa
@@ -41,121 +40,52 @@ class Request:
         self,
         method: str,
         endpoint: str,
-        headers: str = None,
+        token: str = None,
         json: dict = None,
         params: dict = None,
     ):
         if method == "get":
+            if params is None:
+                params = {"page": 1, "limit": 20}
             method = self.session.get
         elif method == "post":
             method = self.session.post
         elif method == "patch":
             method = self.session.patch
+        elif method == "get_all":
+            return self.get_all(endpoint, token)
         else:
             raise NotImplementedError
-        # url = self.base_url + endpoint
-        # headers = {
-        #     "Accept": "application/json",
-        # }
-        # if data:
-        #     headers["Content-Type"] = "application/json"
-        # if token:
-        #     headers["Authorization"] = f"Bearer {token}"
+        url = self.base_url + endpoint
+        headers = {
+            "Accept": "application/json",
+        }
+        if json:
+            headers["Content-Type"] = "application/json"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
 
         # debug spurious API calls
         if DEBUG:
-            d = f"{json=}" if json else ""
+            j = f"{json=}" if json else ""
             p = f"{params=}" if params and params.get("page", 1) != 1 else ""
-            logger.debug(f"{endpoint=} {d} {p}")
+            logger.debug(f"{endpoint=} {j} {p}")
 
-        response = method(endpoint, headers=headers, json=json, params=params)
+        # response = method(url, headers=headers, json=json, params=params)
+        response = self._request_response(method, url, headers, json, params)
+
+        self._check_response(response, endpoint, json, params)
+
         return response
 
-        # status_code, resp_json = self._request_response(
-        #     method, endpoint, headers, json, params
-        # )
-        # if status_code in [200, 201]:
-        #     pass
-        # elif status_code == 204:  # no-content
-        #     logger.debug(
-        #         f"204 no content. {status_code=} "
-        #         f"{endpoint=} {json=} {params=} {resp_json=}"
-        #     )
-        # elif status_code == 400:  # "error" in resp_json
-        #     resp_json["request"] = url[8:]
-        #     if data:
-        #         resp_json["data"] = data
-        #     resp_json["status_code"] = status_code
-        #     raise GameError(resp_json)
-        # else:
-        #     raise NotImplementedError(
-        #         f"Unknown situation. {status_code=} "
-        #         f"{endpoint=} {data=} {params=} {resp_json=}"
-        #     )
-        # return resp_json
-
-    # def _request(
-    #     self,
-    #     method: str,
-    #     endpoint: str,
-    #     token: str = None,
-    #     data: dict = None,
-    #     params: dict = None,
-    # ):
-    #     if method == "get":
-    #         method = self.session.get
-    #     elif method == "post":
-    #         method = self.session.post
-    #     elif method == "patch":
-    #         method = self.session.patch
-    #     else:
-    #         raise NotImplementedError
-    #     url = self.base_url + endpoint
-    #     headers = {
-    #         "Accept": "application/json",
-    #     }
-    #     if data:
-    #         headers["Content-Type"] = "application/json"
-    #     if token:
-    #         headers["Authorization"] = f"Bearer {token}"
-    #
-    #     # debug spurious API calls
-    #     if DEBUG:
-    #         d = f"{data=}" if data else ""
-    #         p = f"{params=}" if params and params.get("page", 1) != 1 else ""
-    #         logger.debug(f"{endpoint=} {d} {p}")
-    #
-    #     status_code, resp_json = self._request_response(
-    #         method, url, headers, data, params
-    #     )
-    #     if status_code in [200, 201]:
-    #         pass
-    #     elif status_code == 204:  # no-content
-    #         logger.debug(
-    #             f"204 no content. {status_code=} "
-    #             f"{endpoint=} {data=} {params=} {resp_json=}"
-    #         )
-    #     elif status_code == 400:  # "error" in resp_json
-    #         resp_json["request"] = url[8:]
-    #         if data:
-    #             resp_json["data"] = data
-    #         resp_json["status_code"] = status_code
-    #         raise GameError(resp_json)
-    #     else:
-    #         raise NotImplementedError(
-    #             f"Unknown situation. {status_code=} "
-    #             f"{endpoint=} {data=} {params=} {resp_json=}"
-    #         )
-    #     return resp_json
-
-    def _request_response(self, method, url, headers, data=None, params=None):
+    def _request_response(self, method, url, headers, json=None, params=None):
         """Make the request until a response is given"""
         while True:
             try:
-                response = method(url, headers=headers, json=data, params=params)
+                response = method(url, headers=headers, json=json, params=params)
             except ConnectionError:
                 # Server is still processing the request. Patience...
-                sleep(0.1)
+                sleep(0.01)
                 continue
             try:
                 resp_json = response.json()
@@ -179,12 +109,13 @@ class Request:
                 4200,
                 4214,
             ]:
-                # catch and wait out time desync errors
+                logger.warning("desync event:")
                 resp_json["request"] = url[8:]
-                if data:
-                    resp_json["data"] = data
+                if json:
+                    resp_json["json"] = json
                 resp_json["status_code"] = status_code
                 logger.warning(resp_json)
+                # catch and wait out time desync errors
                 error_code = resp_json["error"]["code"]
                 if error_code == 4000:
                     # cooldownConflictError: Ship action is still on cooldown
@@ -201,15 +132,38 @@ class Request:
                     raise AssertionError("Unreachable code reached")
                 sleep(t)
             else:
-                return status_code, resp_json
+                return response
+
+    def _check_response(self, response, endpoint, json, params):
+        status_code = response.status_code
+        resp_json = response.json()
+        if status_code in [200, 201]:
+            pass
+        elif status_code == 204:  # no-content
+            logger.debug(
+                f"204 no content. {status_code=} "
+                f"{endpoint=} {json=} {params=} {resp_json=}"
+            )
+        elif status_code == 400:  # "error" in resp_json
+            resp_json["request"] = endpoint
+            if json:
+                resp_json["json"] = json
+            resp_json["status_code"] = status_code
+            raise GameError(resp_json)
+        else:
+            raise NotImplementedError(
+                f"Unknown situation. {status_code=} "
+                f"{endpoint=} {json=} {params=} {resp_json=}"
+            )
 
     def get(self, endpoint, token=None, params=None):
-        if endpoint == "status":
-            endpoint = ""
-        if params is None:
-            params = {"page": 1, "limit": 20}
-
         return self("get", endpoint, token, None, params)
+
+    def post(self, endpoint, token=None, json=None):
+        return self("post", endpoint, token, json)
+
+    def patch(self, endpoint, token=None, json=None):
+        return self("patch", endpoint, token, json)
 
     def get_all(self, endpoint, token=None):
         """yield all results from the get request, not just the first 20 results."""
@@ -217,14 +171,8 @@ class Request:
         page = 0
         while True:
             page += 1
-            resp_json = self.get(endpoint, token, {"page": page, "limit": 20})
+            resp_json = self("get", endpoint, token, {"page": page, "limit": 20})
             yield resp_json
             total += len(resp_json["data"])
             if total == resp_json["meta"]["total"]:
                 break
-
-    def post(self, endpoint, token=None, data=None):
-        return self("post", endpoint, token, data)
-
-    def patch(self, endpoint, token=None, data=None):
-        return self("patch", endpoint, token, data)

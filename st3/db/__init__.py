@@ -132,7 +132,7 @@ class DataBase:
                 VALUES (%s, %s, %s)
                 ON CONFLICT (session) DO NOTHING
                 """,
-                (session, last_reset, next_reset)
+                (session, last_reset, next_reset),
             )
             conn.execute(
                 """
@@ -141,7 +141,7 @@ class DataBase:
                 ON CONFLICT (session) DO UPDATE
                 SET last_reset = EXCLUDED.last_reset, next_reset = EXCLUDED.next_reset
                 """,
-                ("current", last_reset, next_reset)
+                ("current", last_reset, next_reset),
             )
 
         return session
