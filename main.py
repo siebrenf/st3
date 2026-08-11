@@ -1,166 +1,144 @@
 """
 This script handles the backend and automation portion of the game.
 """
-import os
+
+import fcntl
 import time
-import subprocess as sp
-import requests
+from pathlib import Path
 
-# from dotenv import load_dotenv
-from xdg import XDG_DATA_HOME
+from psycopg import connect
 
-
-class DataBase:
-
-    def __init__(self, session: str = None, user: str = "postgres"):
-        data_dir = os.path.join(XDG_DATA_HOME, "st3")
-        self.path = os.path.join(data_dir, "sql")
-        self.log = os.path.join(data_dir, "sql_log.txt")
-
-        if session is None:
-            status = requests.get("https://api.spacetraders.io/v2/").json()
-            last_reset = status["resetDate"]
-            next_reset = status["serverResets"]["next"]
-            session = f"{last_reset}_{next_reset[:10]}"
-        self.session = session
-        self.user = user
-
-        if not self.exists():
-            self.create()
-        if not self.status():
-            self.start()
-
-    def start(self):
-        sp.run(f"pg_ctl -D {self.path} -l {self.log} start", shell=True, check=True, capture_output=True)
-        
-    def stop(self):
-        sp.run(f"pg_ctl -D {self.path} stop", shell=True, check=True, capture_output=True)
-
-    def status(self):
-        """check if the SQL server is running"""
-        if not os.path.exists(self.path):
-            raise FileNotFoundError
-
-        # check=False because an offline server returns exit code 3
-        ret = sp.run(f"pg_ctl -D {self.path} status", shell=True, check=False, capture_output=True)
-        if ret.returncode == 0:
-            running = True
-        elif ret.returncode == 3:
-            running = False
-        else:
-            code = ret.returncode
-            out = ret.stdout.decode().strip()
-            err = ret.stderr.decode().strip()
-            raise NotImplementedError(f"Error code: {code}, stdout: {out}, stderr: {err}")
-        return running
-
-    def exists(self):
-        try:
-            self.status()
-        except FileNotFoundError:
-            return False
-        except NotImplementedError as e:
-            if "not a database cluster directory" in str(e):
-                return False
-            else:
-                raise e
-        return True
-
-    def create(self):
-        """create the database"""
-        if os.path.exists(self.path):
-            raise FileExistsError(f"A DB already exists at {self.path}")
-
-        db_dir = os.path.dirname(self.path)
-        if not os.path.exists(db_dir):
-            os.makedirs(db_dir)
-
-        sp.run(
-            f"initdb --username={self.user} {self.path}",
-            shell=True,
-            check=True,
-            capture_output=True,
-        )
-        # start the server in order to create the database
-        self.start()
-        sp.run(
-            f"createdb --no-password --owner={self.user} --user={self.user} {self.session}",
-            shell=True,
-            check=True,
-            capture_output=True,
-        )
-        # self.stop()
+from st3 import data_dir
+from st3.db import DataBase
 
 
 class Supervisor:
     workers = {}
-    terminate = False
 
-    def __init__(self, dev_mode=False):
-        # sanity checks
-        #   - other supervisor(s) running?
-        #   - >1 DBs running?
-        #   - game server running?
-        pass
+    def __init__(self, sleep=1, dev_mode=False):
+        # max one supervisor
+        self._lock = open(Path(data_dir) / "supervisor.lock", "w")
+        self.lock_acquire()
 
-        # start the DB
-        pass
-
-        # initialize missing DB tables
-        pass
+        # start the SQL server
+        # check the game server
+        # check the DB tables
+        self.session = self.start_db()
 
         while True:
-
             # query which processes should be active
-            #   - list processes expected
-            #   - on shutdown request:
-            #     - self.terminate = True
-            pass
+            workers_requested, reset, shutdown = self.query_db()
 
-            if self.terminate:
-                # update DB:
-                #   - shutdown completed (remove shutdown request)
-                #   - log shutdown event
-                pass
+            if reset:
+                # TODO:
+                #   - log reset event
+                #   - stop the director
+                #   - stop the workers
+                #   - stop the messenger
+                for role, pid in self.workers.items():
+                    self.stop(role, pid)
+                # start a new session DB
+                self.session = self.start_db()
+                continue
 
+            if shutdown:
+                self.shutdown()
                 break
 
             # query which processes are active
-            #   - query last heartbeat
-            #   - on timeout:
-            #     - update table worker_status
-            #   - on crash:
-            #     - list processes to restart
-            #     - log crash events
-            #     - update table worker_status
-            #   - on missing:
-            #     - list processes to start
-            pass
+            workers_alive, workers_dead = self.pulse_workers()
 
             if dev_mode:
                 # file watching
-                #   - list processes to restart
+                #   - add worker to workers_dead
                 #   - log code_change event
                 pass
 
             # resolve (re)start and stop commands
-            #   - on requested deactivations:
-            #     - log stop event
-            pass
+            for role, pid in workers_dead.items():
+                self.stop(role, pid)
 
-            # stop processes
-            #   - ensure graceful shutdowns
-            pass
+            for role, n_workers in workers_requested.items():
+                n = n_workers - workers_alive.get(role, 0)
+                if n > 0:
+                    self.start(role)
+                elif n < 0:
+                    self.stop(role)
 
-            # start processes
-            #   - log start event
-            pass
+            time.sleep(sleep)
 
-            time.sleep(1)
+        self.lock_release()
 
-        # # stop the DB
-        # pass
+    def lock_acquire(self):
+        try:
+            fcntl.flock(
+                self._lock,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError:
+            self._lock.close()
+            self._lock = None
+            raise RuntimeError("Supervisor already running")
 
+    def lock_release(self):
+        if self._lock is not None:
+            fcntl.flock(self._lock, fcntl.LOCK_UN)
+            self._lock.close()
+            self._lock = None
+
+    @staticmethod
+    def start_db():
+        while True:
+            try:
+                return DataBase().session
+                break
+            except RuntimeError as e:
+                # game server might be between resets
+                print(str(e))
+                time.sleep(60)
+
+    def query_db(self):
+        with connect(f"dbname={self.session} user=postgres") as conn:
+            ret = conn.execute("""SELECT * FROM workers""").fetchall()
+        workers_requested = {k: v for k, v, _ in ret}
+        reset = workers_requested.pop("reset")
+        shutdown = workers_requested.pop("shutdown")
+        return workers_requested, reset, shutdown
+
+    def pulse_workers(self):
+        workers_alive = {}
+        workers_dead = {}
+        # TODO:
+        #   - query last heartbeat
+        #   - on timeout:
+        #     - update table worker_status in DB
+        #     - log timeout events
+        #   - on crash:
+        #     - update table worker_status in DB
+        #     - log crash events
+        #     - list processes to restart
+        #   - on missing:
+        #     - list processes to start
+        raise NotImplemented
+
+    def start(self, role: str):
+        # TODO:
+        #   - log start event
+        raise NotImplemented
+
+    def stop(self, role: str, pid=None):
+        # TODO:
+        #   - accept pid to specify a worker
+        #   - ensure graceful shutdowns
+        #   - log stop event
+        raise NotImplemented
+
+    def shutdown(self):
+        # TODO:
+        #  - graceful shutdowns for all workers
+        #  - remove shutdown command from DB
+        #  - log shutdown event
+        raise NotImplemented
 
 
 if __name__ == "__main__":

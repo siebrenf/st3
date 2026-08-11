@@ -1,0 +1,1 @@
+CREATE INDEX shipyards_systemSymbol_idx ON shipyards("systemSymbol");

@@ -1,0 +1,1 @@
+CREATE INDEX jump_gates_systemSymbol_idx ON jump_gates("systemSymbol");
