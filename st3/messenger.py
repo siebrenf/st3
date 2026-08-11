@@ -83,7 +83,8 @@ class Messenger:
         if time.remaining(self.next_reset) > 0:
             return False
 
-        # check for invalid token error (TODO: check code)
+        # check for invalid token error
+        # TODO: check code (status_code == 401)
         if response.json().get("error", {}).get("code") != 4104:
             return False
 

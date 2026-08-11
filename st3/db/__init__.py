@@ -5,6 +5,7 @@ import requests
 from psycopg import connect, sql
 
 from st3 import data_dir
+from st3.logging import logger
 
 
 class DataBase:
@@ -37,7 +38,7 @@ class DataBase:
     def _init_server(self):
         """create the SQL server"""
         if self.debug:
-            print("Initializing SQL server")
+            logger.debug("Initializing SQL server")
         sp.run(
             f"initdb --username=postgres {self.path}",
             shell=True,
@@ -69,7 +70,7 @@ class DataBase:
 
     def start(self):
         if self.debug:
-            print("Starting SQL server")
+            logger.debug("Starting SQL server")
         sp.run(
             f"pg_ctl -D {self.path} -l {self.log} start",
             shell=True,
@@ -79,7 +80,7 @@ class DataBase:
 
     def stop(self):
         if self.debug:
-            print("Stopping SQL server")
+            logger.debug("Stopping SQL server")
         sp.run(
             f"pg_ctl -D {self.path} stop", shell=True, check=True, capture_output=True
         )
@@ -163,7 +164,7 @@ class DataBase:
     def _create(self):
         """create the database"""
         if self.debug:
-            print(f"Creating database {self.session}")
+            logger.debug(f"Creating database {self.session}")
         sp.run(
             f"createdb --no-password --owner=postgres --user=postgres {self.session}",
             shell=True,
@@ -230,25 +231,25 @@ class DataBase:
             for table in sorted((self.schema_dir / "tables").iterdir()):
                 if table.stem not in tables:
                     if self.debug:
-                        print(f"Creating table {table.stem}")
+                        logger.debug(f"Creating table {table.stem}")
                     conn.execute(sql.SQL(table.read_text()))
 
                     index = self.schema_dir / "indexes" / table.name
                     if index.exists():
                         if self.debug:
-                            print(f"Creating index {index.stem}")
+                            logger.debug(f"Creating index {index.stem}")
                         conn.execute(sql.SQL(index.read_text()))
 
                     default = self.schema_dir / "defaults" / table.name
                     if default.exists():
                         if self.debug:
-                            print(f"Inserting default into {default.stem}")
+                            logger.debug(f"Inserting default into {default.stem}")
                         conn.execute(sql.SQL(default.read_text()))
 
     def drop(self, name, kind: str = "table"):
         """drop a table, index or view"""
         if self.debug:
-            print(f"Dropping {kind} {name}")
+            logger.debug(f"Dropping {kind} {name}")
         with connect(f"dbname={self.session} user=postgres") as conn:
             if kind == "table":
                 conn.execute("""DROP TABLE IF EXISTS %s CASCADE""", (name,))
@@ -283,6 +284,6 @@ class DataBase:
     #         self.stop()
     #     if self.path.is_dir():
     #         if self.debug:
-    #             print(f"Deleting {self.path}")
+    #             logger.debug(f"Deleting {self.path}")
     #         shutil.rmtree(self.path)
     #         self.log.unlink()

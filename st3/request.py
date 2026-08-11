@@ -71,7 +71,6 @@ class Request:
             p = f"{params=}" if params and params.get("page", 1) != 1 else ""
             logger.debug(f"{endpoint=} {j} {p}")
 
-        # response = method(url, headers=headers, json=json, params=params)
         response = self._request_response(method, url, headers, json, params)
 
         self._check_response(response, endpoint, json, params)
