@@ -6,7 +6,6 @@ dependencies:
   - python  >=3.10
 
   - loguru
-  - matplotlib-base
   - networkx
   - psycopg
   - requests-ratelimiter

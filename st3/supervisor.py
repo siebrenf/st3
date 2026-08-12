@@ -5,10 +5,11 @@ This script handles the backend and automation portion of the game.
 import fcntl
 import time
 from pathlib import Path
+import multiprocessing as mp
 
 from psycopg import connect
 
-from st3 import data_dir
+from st3 import DATA_DIR
 from st3.db import DataBase
 from st3.logging import logger
 
@@ -18,7 +19,7 @@ class Supervisor:
 
     def __init__(self, sleep=1, dev_mode=False):
         # max one supervisor
-        self._lock = open(Path(data_dir) / "supervisor.lock", "w")
+        self._lock = open(Path(DATA_DIR) / "supervisor.lock", "w")
         self.lock_acquire()
 
         # start the SQL server
@@ -31,15 +32,7 @@ class Supervisor:
             workers_requested, reset, shutdown = self.query_db()
 
             if reset:
-                # TODO:
-                #   - log reset event
-                #   - stop the director
-                #   - stop the workers
-                #   - stop the messenger
-                for role, pid in self.workers.items():
-                    self.stop(role, pid)
-                # start a new session DB
-                self.session = self.start_db()
+                self.reset()
                 continue
 
             if shutdown:
@@ -125,14 +118,36 @@ class Supervisor:
     def start(self, role: str):
         # TODO:
         #   - log start event
-        raise NotImplemented
+
+        worker = mp.Process(
+            target=Worker,
+            kwargs={"role": role},
+        )
+        worker.start()
+        if role not in self.workers:
+            self.workers[role] = []
+        self.workers[role].append(worker)
 
     def stop(self, role: str, pid=None):
         # TODO:
         #   - accept pid to specify a worker
         #   - ensure graceful shutdowns
         #   - log stop event
-        raise NotImplemented
+        for worker in self.workers[role]:
+            if pid is None or worker.pid == pid:
+                worker.stop()
+                break
+
+    def reset(self):
+        # TODO:
+        #   - log reset event
+        #   - stop the director
+        #   - stop the workers
+        #   - stop the messenger
+        for role, pid in self.workers.items():
+            self.stop(role, pid)
+        # start a new session DB
+        self.session = self.start_db()
 
     def shutdown(self):
         # TODO:
