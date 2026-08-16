@@ -4,7 +4,7 @@ from pathlib import Path
 import requests
 from psycopg import connect, sql
 
-from st3 import data_dir
+from st3 import DATA_DIR
 from st3.logging import logger
 
 
@@ -16,8 +16,8 @@ class DataBase:
 
     def __init__(self, debug=False):
         # set up the SQL server
-        self.path = data_dir / "sql"
-        self.log = data_dir / "sql_log.txt"
+        self.path = DATA_DIR / "sql"
+        self.log = DATA_DIR / "sql_log.txt"
         self.schema_dir = Path(__file__).parent / "schemas"
         self.debug = debug
 

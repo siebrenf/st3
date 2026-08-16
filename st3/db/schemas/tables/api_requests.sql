@@ -2,9 +2,10 @@ CREATE TABLE api_requests (
     -- request
     id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     agent            text REFERENCES agents(symbol),
-    method           text NOT NULL, --get/post/patch/get_all
+    method           text NOT NULL, --get/post/patch
     endpoint         text NOT NULL, --suffix only
     json             JsonB,
+    params           JsonB,
 
     -- queue
     priority         integer NOT NULL DEFAULT 0,

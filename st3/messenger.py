@@ -53,18 +53,19 @@ class Messenger:
             self.conn.execute(
                 """
                 UPDATE api_requests
-                SET completed = true,
-                 completed_at = now(),
-                 response_status = %s,
-                 response_headers = %s,
-                 response_json = %s
+                SET 
+                    completed = true,
+                    completed_at = now(),
+                    response_status = %s,
+                    response_headers = %s,
+                    response_json = %s
                 WHERE id = %s
                 """,
                 (ret.status_code, ret.headers, ret.json(), api_request["id"]),
             )
             self.conn.execute(
-                "SELECT pg_notify('api_queue', %s)",
-                (api_request["id"],),
+                "SELECT pg_notify('api_response', %s)",
+                (str(api_request["id"]),),
             )
             self.conn.commit()
 
@@ -110,3 +111,101 @@ class Messenger:
         self.conn.commit()
         self.conn.close()
         return True
+
+
+class RequestDB:
+    def __init__(self):
+        self.session = get_session()
+        self.conn = None
+
+    def _open(self):
+        self.conn = connect(f"dbname={self.session} user=postgres")
+
+    def _close(self):
+        self.conn.close()
+        self.conn = None
+
+    def __enter__(self):
+        if self.conn is None:
+            self._open()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.conn is not None:
+            self._close()
+
+    def get(self, endpoint, json=None, params=None, agent=None, priority=0):
+        return self._queue_request("get", endpoint, json, params, agent, priority)
+
+    def post(self, endpoint, json=None, agent=None, priority=0):
+        return self._queue_request("post", endpoint, json, None, agent, priority)
+
+    def patch(self, endpoint, json=None, agent=None, priority=0):
+        return self._queue_request("patch", endpoint, json, None, agent, priority)
+
+    def get_all(self, endpoint, json=None, agent=None, priority=0):
+        """yield all results from the get request, not just the first 20 results."""
+        close = False
+        if self.conn is None:
+            self._open()
+            close = True
+
+        total = 0
+        page = 0
+        while True:
+            page += 1
+            resp_json = self.get(
+                endpoint,
+                json,
+                {"page": page, "limit": 20},
+                agent,
+                priority,
+            )[0]
+            yield resp_json
+            total += len(resp_json["data"])
+            if total == resp_json["meta"]["total"]:
+                break
+
+        if close:
+            self._close()
+        return
+
+    def _queue_request(self, method, endpoint, json, params, agent, priority):
+        close = False
+        if self.conn is None:
+            self._open()
+            close = True
+
+        self.conn.execute("LISTEN api_response")
+        request_id = self.conn.execute(
+            """
+            INSERT INTO api_requests 
+                (agent, method, endpoint, json, params, priority)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (agent, method, endpoint, json, params, priority),
+        ).fetchone()[0]
+        self.conn.execute("NOTIFY api_queue")
+        self.conn.commit()
+
+        while True:
+            for notify in self.conn.notifies(timeout=30):
+                if notify.payload == str(request_id):
+                    break
+
+            response_json, response_status, completed = self.conn.execute(
+                """
+                SELECT response_json, response_status, completed
+                FROM api_requests 
+                WHERE id = %s
+                """,
+                (request_id,),
+            ).fetchone()
+
+            if completed:
+                break
+
+        if close:
+            self._close()
+        return response_json, response_status

@@ -3,7 +3,6 @@ from time import sleep
 from requests.exceptions import ConnectionError, JSONDecodeError  # noqa
 from requests_ratelimiter import LimiterSession  # noqa
 
-from st3.exceptions import GameError
 from st3.logging import logger
 
 DEBUG = True
@@ -52,8 +51,8 @@ class Request:
             method = self.session.post
         elif method == "patch":
             method = self.session.patch
-        elif method == "get_all":
-            return self.get_all(endpoint, token)
+        # elif method == "get_all":
+        #     return self.get_all(endpoint, token)
         else:
             raise NotImplementedError
         url = self.base_url + endpoint
@@ -73,25 +72,44 @@ class Request:
 
         response = self._request_response(method, url, headers, json, params)
 
-        self._check_response(response, endpoint, json, params)
+        # self._check_response(response, endpoint, json, params)
 
         return response
 
     def _request_response(self, method, url, headers, json=None, params=None):
         """Make the request until a response is given"""
+        response = None
         while True:
             try:
                 response = method(url, headers=headers, json=json, params=params)
-            except ConnectionError:
+            except ConnectionError as e:
                 # Server is still processing the request. Patience...
+                if DEBUG:
+                    logger.debug(f"{type(e).__name__}: {e}")
+                    endpoint = url[8:]
+                    logger.debug(f"{method=} {endpoint=} {headers=} {json=} {params=}")
                 sleep(0.01)
                 continue
             try:
                 resp_json = response.json()
-            except JSONDecodeError:
+            except JSONDecodeError as e:
+                if DEBUG:
+                    logger.debug(f"{type(e).__name__}: {e}")
                 resp_json = {}
             status_code = response.status_code
-            if status_code in self.rate_limit_codes:
+            endpoint = url[8:]
+            if status_code in [200, 201]:  # ok/created
+                break
+            elif status_code == 204:  # no-content
+                if DEBUG:
+                    logger.debug("204 no content:")
+                    resp_json["request"] = endpoint
+                    if json:
+                        resp_json["json"] = json
+                    resp_json["status_code"] = status_code
+                    logger.debug(resp_json)
+                break
+            elif status_code in self.rate_limit_codes:
                 logger.debug(resp_json.get("error", {}).get("message", resp_json))
                 sleep(resp_json.get("error", {}).get("data", {}).get("retryAfter", 1))
             elif status_code in self.ddos_protection_codes:
@@ -103,57 +121,77 @@ class Request:
                     f"Retrying in {self.server_down_sleep} sec"
                 )
                 sleep(self.server_down_sleep)
-            elif status_code // 100 == 4 and resp_json["error"]["code"] in [
-                4000,
-                4200,
-                4214,
-            ]:
-                logger.warning("desync event:")
-                resp_json["request"] = url[8:]
-                if json:
-                    resp_json["json"] = json
-                resp_json["status_code"] = status_code
-                logger.warning(resp_json)
-                # catch and wait out time desync errors
-                error_code = resp_json["error"]["code"]
-                if error_code == 4000:
-                    # cooldownConflictError: Ship action is still on cooldown
-                    t = resp_json["error"]["data"]["cooldown"]["remainingSeconds"]
-                elif error_code == 4200:
-                    # navigateInTransitError
-                    raise NotImplementedError(
-                        "TODO: extract the time to arrival from resp_json:", resp_json
-                    )
-                elif error_code == 4214:
-                    # shipInTransitError
-                    t = resp_json["error"]["data"]["secondsToArrival"]
-                else:
-                    raise AssertionError("Unreachable code reached")
-                sleep(t)
+            # elif status_code // 100 == 4 and resp_json["error"]["code"] in [
+            #     4000,
+            #     4200,
+            #     4214,
+            # ]:
+            #     logger.warning("desync event:")
+            #     resp_json["request"] = endpoint
+            #     if json:
+            #         resp_json["json"] = json
+            #     resp_json["status_code"] = status_code
+            #     logger.warning(resp_json)
+            #     # catch and wait out time desync errors
+            #     error_code = resp_json["error"]["code"]
+            #     if error_code == 4000:
+            #         # cooldownConflictError: Ship action is still on cooldown
+            #         t = resp_json["error"]["data"]["cooldown"]["remainingSeconds"]
+            #     elif error_code == 4200:
+            #         # navigateInTransitError
+            #         raise NotImplementedError(
+            #             "TODO: extract the time to arrival from resp_json:", resp_json
+            #         )
+            #     elif error_code == 4214:
+            #         # shipInTransitError
+            #         t = resp_json["error"]["data"]["secondsToArrival"]
+            #     else:
+            #         raise AssertionError("Unreachable code reached")
+            #     sleep(t)
+            elif status_code == 400:  # "error" in resp_json
+                if DEBUG:
+                    logger.debug("400 game error:")
+                    resp_json["request"] = endpoint
+                    if json:
+                        resp_json["json"] = json
+                    resp_json["status_code"] = status_code
+                    logger.debug(resp_json)
+                break
             else:
-                return response
+                # unknown status code
+                if DEBUG:
+                    logger.debug("unknown status code:")
+                    resp_json["request"] = endpoint
+                    if json:
+                        resp_json["json"] = json
+                    resp_json["status_code"] = status_code
+                    logger.debug(resp_json)
+                break
+        return response
 
-    def _check_response(self, response, endpoint, json, params):
-        status_code = response.status_code
-        resp_json = response.json()
-        if status_code in [200, 201]:
-            pass
-        elif status_code == 204:  # no-content
-            logger.debug(
-                f"204 no content. {status_code=} "
-                f"{endpoint=} {json=} {params=} {resp_json=}"
-            )
-        elif status_code == 400:  # "error" in resp_json
-            resp_json["request"] = endpoint
-            if json:
-                resp_json["json"] = json
-            resp_json["status_code"] = status_code
-            raise GameError(resp_json)
-        else:
-            raise NotImplementedError(
-                f"Unknown situation. {status_code=} "
-                f"{endpoint=} {json=} {params=} {resp_json=}"
-            )
+    # def _check_response(self, response, endpoint, json, params):
+    #     status_code = response.status_code
+    #     resp_json = response.json()
+    #     if status_code in [200, 201]:
+    #         pass
+    #     elif status_code == 204:  # no-content
+    #         if DEBUG:
+    #             logger.debug(
+    #                 f"204 no content. {status_code=} "
+    #                 f"{endpoint=} {json=} {params=} {resp_json=}"
+    #             )
+    #     elif status_code == 400:  # "error" in resp_json
+    #         if DEBUG:
+    #             resp_json["request"] = endpoint
+    #             if json:
+    #                 resp_json["json"] = json
+    #             resp_json["status_code"] = status_code
+    #             logger.debug(resp_json)
+    #     else:
+    #         raise NotImplementedError(
+    #             f"Unknown situation. {status_code=} "
+    #             f"{endpoint=} {json=} {params=} {resp_json=}"
+    #         )
 
     def get(self, endpoint, token=None, params=None):
         return self("get", endpoint, token, None, params)
@@ -164,14 +202,14 @@ class Request:
     def patch(self, endpoint, token=None, json=None):
         return self("patch", endpoint, token, json)
 
-    def get_all(self, endpoint, token=None):
-        """yield all results from the get request, not just the first 20 results."""
-        total = 0
-        page = 0
-        while True:
-            page += 1
-            resp_json = self("get", endpoint, token, {"page": page, "limit": 20})
-            yield resp_json
-            total += len(resp_json["data"])
-            if total == resp_json["meta"]["total"]:
-                break
+    # def get_all(self, endpoint, token=None):
+    #     """yield all results from the get request, not just the first 20 results."""
+    #     total = 0
+    #     page = 0
+    #     while True:
+    #         page += 1
+    #         resp_json = self("get", endpoint, token, {"page": page, "limit": 20})
+    #         yield resp_json
+    #         total += len(resp_json["data"])
+    #         if total == resp_json["meta"]["total"]:
+    #             break
