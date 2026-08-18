@@ -1,4 +1,5 @@
 from psycopg import connect
+from st3.time import read
 
 
 def get_session(return_next=False):
@@ -8,7 +9,7 @@ def get_session(return_next=False):
         ).fetchone()
     session = f"{last_reset}_{next_reset[:10]}"
     if return_next:
-        return session, next_reset
+        return session, read(next_reset)
     return session
 
 

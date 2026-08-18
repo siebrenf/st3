@@ -8,8 +8,7 @@ from st3.request import Request
 
 class Messenger:
     def __init__(self):
-        self.session, next_reset = get_session(True)
-        self.next_reset = time.read(next_reset)
+        self.session, self.next_reset = get_session(True)
         self.request = Request()
         self.conn = connect(
             f"dbname={self.session} user=postgres", row_factory=dict_row
@@ -37,7 +36,7 @@ class Messenger:
                     break
                 continue
 
-            self.conn.commit()
+            # self.conn.commit()
 
             ret = self.request(
                 method=api_request["method"],

@@ -10,8 +10,8 @@ from st3.logging import logger
 
 class DataBase:
     """
-    Controls the creation and destruction of the session database.
-    This class is intended for the observer and the user only.
+    Controls the creation and destruction of the st3 and session database.
+    This class is intended for the Supervisor and the user only.
     """
 
     def __init__(self, debug=False):
@@ -85,8 +85,7 @@ class DataBase:
             f"pg_ctl -D {self.path} stop", shell=True, check=True, capture_output=True
         )
 
-    @staticmethod
-    def _get_session():
+    def _get_session(self):
         status = requests.get("https://api.spacetraders.io/v2/").json()
         if (
             status.get("status")
@@ -100,23 +99,8 @@ class DataBase:
 
         # save the session in the st3.sessions table
         # and update the "current" session with the same details
-        with connect("dbname=postgres user=postgres") as conn:
-            exists = conn.execute(
-                """
-                SELECT EXISTS (
-                    SELECT FROM pg_database
-                    WHERE datname = %s
-                )
-                """,
-                ("st3",),
-            ).fetchone()[0]
-        if not exists:
-            sp.run(
-                f"createdb --no-password --owner=postgres --user=postgres st3",
-                shell=True,
-                check=True,
-                capture_output=True,
-            )
+        if not self.exists("st3"):
+            self._create("st3")
         with connect("dbname=st3 user=postgres") as conn:
             conn.execute(
                 """
@@ -147,9 +131,10 @@ class DataBase:
 
         return session
 
-    def exists(self):
-        """check if the session database exists"""
-        # note this cmd connects to a default database
+    def exists(self, session=None):
+        """check if a database exists"""
+        if session is None:
+            session = self.session
         with connect("dbname=postgres user=postgres") as conn:
             return conn.execute(
                 """
@@ -158,15 +143,17 @@ class DataBase:
                     WHERE datname = %s
                 )
                 """,
-                (self.session,),
+                (session,),
             ).fetchone()[0]
 
-    def _create(self):
-        """create the database"""
+    def _create(self, session=None):
+        """create a database"""
+        if session is None:
+            session = self.session
         if self.debug:
-            logger.debug(f"Creating database {self.session}")
+            logger.debug(f"Creating database {session}")
         sp.run(
-            f"createdb --no-password --owner=postgres --user=postgres {self.session}",
+            f"createdb --no-password --owner=postgres --user=postgres {session}",
             shell=True,
             check=True,
             capture_output=True,
@@ -176,7 +163,7 @@ class DataBase:
         with connect("dbname=postgres user=postgres") as conn:
             conn.execute(
                 sql.SQL("ALTER DATABASE {} SET timezone TO 'UTC'").format(
-                    sql.Identifier(self.session)
+                    sql.Identifier(session)
                 )
             )
 
