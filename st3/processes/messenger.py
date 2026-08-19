@@ -1,5 +1,5 @@
 from os import getpid
-from uuid import uuid1
+from sys import argv
 
 from psycopg import connect
 from psycopg.rows import dict_row
@@ -10,9 +10,9 @@ from st3.request import Request
 
 
 class Messenger:
-    def __init__(self):
+    def __init__(self, uuid):
+        self.uuid = uuid
         self.pid = getpid()
-        self.uuid = uuid1()
         self.session, self.next_reset = get_session(True)
         self.request = Request()
         self.conn = connect(
@@ -32,7 +32,8 @@ class Messenger:
         self.conn.commit()
 
         while True:
-            api_request = self.conn.execute("""
+            api_request = self.conn.execute(
+                """
                 SELECT
                     r.*,
                     a.token
@@ -41,7 +42,8 @@ class Messenger:
                 WHERE r.completed = false
                 ORDER BY r.priority DESC, r.id ASC
                 LIMIT 1;
-                """).fetchone()
+                """
+            ).fetchone()
             if api_request is None:
                 # sleep until notified or until timeout
                 for _ in self.conn.notifies(timeout=10):
@@ -223,4 +225,4 @@ class RequestDB:
 
 
 if __name__ == "__main__":
-    m = Messenger()
+    m = Messenger(uuid=argv[1])

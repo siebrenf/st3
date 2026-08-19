@@ -21,13 +21,13 @@ class Supervisor:
     """
 
     session = None
-    processes = {}  # pid: psutil.Process(pid)
-    role2pids = {
+    processes = {}  # uuid: psutil.Process(pid)
+    role2uuids = {
         "directors": [],
         "messengers": [],
         "workers": [],
     }
-    pid2role = {}  # pid: role
+    uuid2role = {}  # uuid: role
 
     uuid = None
     pid = None
@@ -42,9 +42,7 @@ class Supervisor:
             with connect(f"dbname={self.session} user=postgres") as self.conn:
                 self.heartbeat()
 
-                processes_requested, heartbeats, reset, shutdown = (
-                    self.read_db()
-                )  # noqa
+                processes_requested, heartbeats, reset, shutdown = self.read_db()
 
                 if reset:
                     self.reset()
@@ -80,33 +78,35 @@ class Supervisor:
 
         # register supervisor process
         self.pid = getpid()
-        self.uuid = uuid1()
+        self.uuid = str(uuid1())
         self.start_time = time.now()
         self.register()
 
     def clean_old_processes(self):
         with connect(f"dbname={self.session} user=postgres") as conn:
             ret = conn.execute(
-                """SELECT pid, role FROM backend.processes WHERE stopped_at IS NULL"""
+                """SELECT uuid, pid FROM backend.processes WHERE stopped_at IS NULL"""
             ).fetchall()
-            for pid, role in ret:
+            for uuid, pid in ret:
+                uuid = str(uuid)
+                # check if the PID and UUID both exist
                 if psutil.pid_exists(pid):
-                    # orphaned process from a previous supervisor
                     p = psutil.Process(pid)
-                    try:
-                        p.wait(timeout=5)
-                    except psutil.TimeoutExpired:
-                        p.kill()
-                        p.wait()
+                    if uuid in p.cmdline():
+                        # orphaned process from a previous supervisor
+                        try:
+                            p.wait(timeout=5)
+                        except psutil.TimeoutExpired:
+                            p.kill()
+                            p.wait()
                 # mark process as stopped
                 conn.execute(
                     """
                     UPDATE backend.processes
                     SET stopped_at = now()
-                    WHERE pid = %s
-                      AND role = %s
+                    WHERE uuid = %s
                     """,
-                    (pid, role),
+                    (uuid,),
                 )
 
     def register(self):
@@ -124,8 +124,8 @@ class Supervisor:
         self.log_event("Shutting down")
         draining_processes = []
         for role in ["directors", "workers", "messenger"]:
-            for pid in self.role2pids[role]:
-                draining_processes.append(self.stop(pid))
+            for uuid in self.role2uuids[role]:
+                draining_processes.append(self.stop(uuid))
         for p in draining_processes:
             p.wait()
         self.conn.execute(
@@ -143,8 +143,8 @@ class Supervisor:
     def reset(self):
         self.log_event("Resetting")
         draining_processes = []
-        for pid in self.processes:
-            draining_processes.append(self.stop(pid))
+        for uuid in self.processes:
+            draining_processes.append(self.stop(uuid))
         for p in draining_processes:
             p.wait()
         self.conn.execute("NOTIFY supervisor")
@@ -223,33 +223,35 @@ class Supervisor:
         heartbeats = {}
         ret = self.conn.execute(
             """
-            SELECT pid, heartbeat_at FROM backend.processes WHERE stopped_at IS NULL
+            SELECT uuid, heartbeat_at FROM backend.processes WHERE stopped_at IS NULL
             """,
             (None,),
         ).fetchall()
-        for pid, heartbeat in ret:
-            heartbeats[pid] = heartbeat
+        for uuid, heartbeat in ret:
+            heartbeats[uuid] = heartbeat
 
         return processes_requested, heartbeats, reset, shutdown
 
-    def update_roles_and_pids(self):
-        ret = self.conn.execute("""
-            SELECT pid, role FROM backend.processes
+    def update_roles_and_uuids(self):
+        ret = self.conn.execute(
+            """
+            SELECT uid, role FROM backend.processes
             WHERE stopped_at IS NULL
             ORDER BY started_at ASC
-            """).fetchall()
-        for pid, role in ret:
-            if pid not in self.role2pids[role]:
-                self.role2pids[role].append(pid)
+            """
+        ).fetchall()
+        for uuid, role in ret:
+            if uuid not in self.role2uuids[role]:
+                self.role2uuids[role].append(uuid)
 
-        for role, pids in self.role2pids.items():
-            for pid in pids:
-                self.pid2role[pid] = role
+        for role, uuids in self.role2uuids.items():
+            for uuid in uuids:
+                self.uuid2role[uuid] = role
 
     def clean_dead_processes(self, heartbeats, heartbeat_timeout):
         draining_processes = []
-        for pid, role in self.yield_dead_processes(heartbeats, heartbeat_timeout):
-            draining_processes.append(self.stop(pid, role))
+        for uuid, role in self.yield_dead_processes(heartbeats, heartbeat_timeout):
+            draining_processes.append(self.stop(uuid, role))
         for p in draining_processes:
             try:
                 p.wait(timeout=5)
@@ -259,63 +261,63 @@ class Supervisor:
 
     def yield_dead_processes(self, hbs, timeout):
         # TODO: use PIDs from DB instead of local dict?
-        for pid in list(self.processes):
-            role = self.pid2role[pid]
-            if not psutil.pid_exists(pid):
-                self.log_event(f"Crashed: {role} process with {pid=}", "error")
-                # no process left to stop
-                self.conn.execute(
-                    """
-                    UPDATE backend.processes
-                    SET stopped_at = now()
-                    WHERE pid = %s
-                      AND role = %s
-                      AND stopped_at IS NULL
-                    """,
-                    (pid, role),
-                )
-                self.conn.commit()
-                del self.processes[pid]
-                self.role2pids[role].remove(pid)
-                del self.pid2role[pid]
-                continue
-            if (time.now() - hbs[pid]).seconds >= timeout:
-                self.log_event(f"Timeout: {role} process with {pid=}", "error")
-                yield pid, role
+        for uuid in list(self.processes):
+            # if not psutil.pid_exists(pid):
+            #     self.log_event(f"Crashed: {role} process with {uuid=}", "error")
+            #     # no process left to stop
+            #     self.conn.execute(
+            #         """
+            #         UPDATE backend.processes
+            #         SET stopped_at = now()
+            #         WHERE uuid = %s
+            #           AND stopped_at IS NULL
+            #         """,
+            #         (uuid,),
+            #     )
+            #     self.conn.commit()
+            #     del self.processes[uuid]
+            #     self.role2uuids[role].remove(uuid)
+            #     del self.uuid2role[uuid]
+            #     continue
+            if (time.now() - hbs[uuid]).seconds >= timeout:
+                role = self.uuid2role[uuid]
+                self.log_event(f"Timeout: {role} process with {uuid=}", "error")
+                yield uuid, role
                 continue
 
     def start(self, role: str):
-        pid = sp.Popen([executable, "-m", f"st3.processes.{role}"]).pid
-        self.log_event(f"Starting {role} process with {pid=}")
+        uuid = str(uuid1())
+        pid = sp.Popen([executable, "-m", f"st3.processes.{role}", uuid]).pid
+        self.log_event(f"Starting {role} process with {uuid=}")
         p = psutil.Process(pid)
         # start measuring CPU usage
         _ = p.cpu_percent()
-        self.processes[pid] = p
-        self.role2pids[role].append(pid)
-        self.pid2role[pid] = role
+        self.processes[uuid] = p
+        self.role2uuids[role].append(uuid)
+        self.uuid2role[uuid] = role
 
-    def stop(self, pid: str = None, role: str = None):
-        if pid is None and role is None:
-            raise ValueError("pid or role must be specified")
+    def stop(self, uuid: str = None, role: str = None):
+        if uuid is None and role is None:
+            raise ValueError("uuid or role must be specified")
         elif role is None:
-            role = self.pid2role[pid]
-        elif pid is None:
+            role = self.uuid2role[uuid]
+        elif uuid is None:
             # kills the oldest process first
-            pid = self.role2pids[role][0]
-        self.log_event(f"Stopping {role} process with {pid=}")
-        p = self.processes[pid]
+            uuid = self.role2uuids[role][0]
+        self.log_event(f"Stopping {role} process with {uuid=}")
+        p = self.processes[uuid]
         p.terminate()
-        del self.processes[pid]
-        self.role2pids[role].remove(pid)
-        del self.pid2role[pid]
+        del self.processes[uuid]
+        self.role2uuids[role].remove(uuid)
+        del self.uuid2role[uuid]
         return p
 
     def cpu_usage(self, processes_requested):
         modifier = 0
         pcts = []
-        n = len(self.role2pids["workers"])
-        for pid in self.role2pids["workers"]:
-            p = self.processes[pid]
+        n = len(self.role2uuids["workers"])
+        for uuid in self.role2uuids["workers"]:
+            p = self.processes[uuid]
             pcts.append(p.cpu_percent())
         if sum(pcts) / n > 0.9:
             modifier += 1
@@ -334,18 +336,18 @@ class Supervisor:
                 """,
                 (Jsonb(processes_requested["workers"]), "workers"),
             )
-        for i, pid in enumerate(self.role2pids["workers"]):
+        for i, uuid in enumerate(self.role2uuids["workers"]):
             self.conn.execute(
                 """
-                INSERT INTO backend.cpu_usage (pid, cpu_usage)
+                INSERT INTO backend.cpu_usage (uuid, cpu_usage)
                 """,
-                (pid, pcts[i]),
+                (uuid, pcts[i]),
             )
         self.conn.commit()
 
     def balance_processes(self, processes_requested):
         for role, n_requested in processes_requested.items():
-            n_current = len(self.role2pids[role])
+            n_current = len(self.role2uuids[role])
 
             while n_current < n_requested:
                 self.start(role)

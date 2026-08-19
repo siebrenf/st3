@@ -102,13 +102,15 @@ class DataBase:
         if not self.exists("st3"):
             self._create("st3")
         with connect("dbname=st3 user=postgres") as conn:
-            conn.execute("""
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS sessions (
                     session text PRIMARY KEY,
                     last_reset text,
                     next_reset text
                 )
-                """)
+                """
+            )
             conn.execute(
                 """
                 INSERT INTO sessions (session, last_reset, next_reset)
@@ -168,11 +170,13 @@ class DataBase:
     @staticmethod
     def list_all_dbs():
         with connect("dbname=postgres user=postgres") as conn:
-            cur = conn.execute("""
+            cur = conn.execute(
+                """
                 SELECT datname
                 FROM pg_catalog.pg_database
                 ORDER BY datname
-                """)
+                """
+            )
             return [row[0] for row in cur.fetchall()]
 
     def list_schemas(self, session=None):
