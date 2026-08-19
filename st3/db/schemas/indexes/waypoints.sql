@@ -1,1 +1,0 @@
-CREATE INDEX waypoints_systemSymbol_idx ON waypoints("systemSymbol");

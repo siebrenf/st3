@@ -1,3 +1,6 @@
+from os import getpid
+from uuid import uuid1
+
 from psycopg import connect
 from psycopg.rows import dict_row
 
@@ -8,18 +11,28 @@ from st3.request import Request
 
 class Messenger:
     def __init__(self):
+        self.pid = getpid()
+        self.uuid = uuid1()
         self.session, self.next_reset = get_session(True)
         self.request = Request()
         self.conn = connect(
             f"dbname={self.session} user=postgres", row_factory=dict_row
         )
 
+        # register the process
+        self.conn.execute(
+            """
+            INSERT INTO backend.processes
+            (uuid, pid, role)
+            VALUES (%s, %s, %s)
+            """,
+            (self.uuid, self.pid, "messenger"),
+        )
         self.conn.execute("LISTEN api_queue")
         self.conn.commit()
 
         while True:
-            api_request = self.conn.execute(
-                """
+            api_request = self.conn.execute("""
                 SELECT
                     r.*,
                     a.token
@@ -28,8 +41,7 @@ class Messenger:
                 WHERE r.completed = false
                 ORDER BY r.priority DESC, r.id ASC
                 LIMIT 1;
-                """
-            ).fetchone()
+                """).fetchone()
             if api_request is None:
                 # sleep until notified or until timeout
                 for _ in self.conn.notifies(timeout=10):
@@ -208,3 +220,7 @@ class RequestDB:
         if close:
             self._close()
         return response_json, response_status
+
+
+if __name__ == "__main__":
+    m = Messenger()

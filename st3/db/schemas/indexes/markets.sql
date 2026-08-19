@@ -1,1 +1,0 @@
-CREATE INDEX markets_systemSymbol_idx ON markets("systemSymbol");
