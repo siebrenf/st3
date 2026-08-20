@@ -142,10 +142,10 @@ class Supervisor:
             conn.execute(
                 """
                 INSERT INTO backend.processes
-                (uuid, pid, role, started_at)
-                VALUES (%s, %s, %s, %s)
+                (uuid, pid, role)
+                VALUES (%s, %s, %s)
                 """,
-                (self.uuid, getpid(), "supervisor", self.workers_rebalance_time),
+                (self.uuid, getpid(), "supervisor"),
             )
 
     def heartbeat(self):
