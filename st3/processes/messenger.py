@@ -32,8 +32,7 @@ class Messenger:
         self.conn.commit()
 
         while True:
-            api_request = self.conn.execute(
-                """
+            api_request = self.conn.execute("""
                 SELECT
                     r.*,
                     a.token
@@ -42,8 +41,7 @@ class Messenger:
                 WHERE r.completed = false
                 ORDER BY r.priority DESC, r.id ASC
                 LIMIT 1;
-                """
-            ).fetchone()
+                """).fetchone()
             if api_request is None:
                 # sleep until notified or until timeout
                 for _ in self.conn.notifies(timeout=10):

@@ -28,10 +28,16 @@ class Supervisor:
 
     uuid = None
     _lock = None
-    start_time = None  # updated on reset
+    workers_rebalance_time = None
     conn = None
 
-    def __init__(self, sleep=30, heartbeat_timeout=60, dev_mode=False):
+    def __init__(
+        self,
+        sleep=30,
+        heartbeat_timeout=60,
+        worker_rebalance_cooldown=60,
+        dev_mode=False,
+    ):
         self.startup()
 
         while True:
@@ -56,7 +62,7 @@ class Supervisor:
                     #   - log event
                     raise NotImplementedError
 
-                self.cpu_usage(processes_requested)
+                self.cpu_usage(processes_requested, worker_rebalance_cooldown)
 
                 self.balance_processes(processes_requested)
 
@@ -74,7 +80,7 @@ class Supervisor:
 
         # register supervisor process
         self.uuid = str(uuid1())
-        self.start_time = time.now()
+        self.workers_rebalance_time = time.now()
         self.register()
 
     def lock_acquire(self):
@@ -139,7 +145,7 @@ class Supervisor:
                 (uuid, pid, role, started_at)
                 VALUES (%s, %s, %s, %s)
                 """,
-                (self.uuid, getpid(), "supervisor", self.start_time),
+                (self.uuid, getpid(), "supervisor", self.workers_rebalance_time),
             )
 
     def heartbeat(self):
@@ -177,13 +183,11 @@ class Supervisor:
         self.uuid2role = {}
         self.uuid2heartbeat = {}
         self.role2uuids = {}
-        ret = self.conn.execute(
-            """
+        ret = self.conn.execute("""
             SELECT uuid, role, heartbeat_at 
             FROM backend.processes 
             WHERE stopped_at IS NULL
-            """
-        ).fetchall()
+            """).fetchall()
         for uuid, role, heartbeat in ret:
             uuid = str(uuid)
             if uuid == self.uuid:
@@ -213,7 +217,7 @@ class Supervisor:
         # start the SQL server + session DB + DB tables
         old_session = self.session.copy()
         self.start_db()
-        self.start_time = time.now()
+        self.workers_rebalance_time = time.now()
         new_session = self.session.copy()
         if old_session != new_session:
             # a game restart occurred (and new DB was created)
@@ -295,29 +299,39 @@ class Supervisor:
             # kills the oldest process first
             uuid = self.role2uuids[role][0]
         self.log_event(f"Stopping {role} process with {uuid=}")
-        p = self.uuid2processes[uuid]
+        p = self.uuid2processes.pop(uuid)
         p.terminate()
-        del self.uuid2processes[uuid]
         del self.uuid2role[role]
         del self.uuid2heartbeat[role]
         self.role2uuids[role].remove(uuid)
         return p
 
-    def cpu_usage(self, processes_requested):
+    def cpu_usage(self, processes_requested, worker_rebalance_cooldown):
         modifier = 0
         pcts = []
         n = len(self.role2uuids["workers"])
         for uuid in self.role2uuids["workers"]:
-            p = self.uuid2processes[uuid]
-            pcts.append(p.cpu_percent())
-        if sum(pcts) / n > 0.9:
+            pct = self.uuid2processes[uuid].cpu_percent()
+            self.conn.execute(
+                """
+                INSERT INTO backend.cpu_usage (uuid, cpu_usage) VALUES (%s, %s)
+                """,
+                (uuid, pct),
+            )
+            pcts.append(pct)
+        if sum(pcts) / n >= 0.95:
             modifier += 1
-        elif n > 1 and sum(pcts) / (n - 1) < 0.6:
+        elif n > 1 and sum(pcts) / (n - 1) < 0.75:
             modifier -= 1
 
         # only change the number of workers after a grace period
-        if modifier != 0 and (time.now() - self.start_time).seconds > 120:
+        if (
+            modifier != 0
+            and (time.now() - self.workers_rebalance_time).seconds
+            > worker_rebalance_cooldown
+        ):
             processes_requested["workers"] += modifier
+            self.workers_rebalance_time = time.now()
             self.conn.execute(
                 """
                 UPDATE backend.supervisor
@@ -326,13 +340,6 @@ class Supervisor:
                 WHERE key = %s;
                 """,
                 (Jsonb(processes_requested["workers"]), "workers"),
-            )
-        for i, uuid in enumerate(self.role2uuids["workers"]):
-            self.conn.execute(
-                """
-                INSERT INTO backend.cpu_usage (uuid, cpu_usage)
-                """,
-                (uuid, pcts[i]),
             )
         self.conn.commit()
 
