@@ -9,8 +9,8 @@ CREATE TABLE backend.api_requests (
 
     -- queue
     priority         integer NOT NULL DEFAULT 0,
-    completed        boolean NOT NULL DEFAULT false,
     created_at       timestamptz NOT NULL DEFAULT now(),
+    requested_at     timestamptz,
     completed_at     timestamptz,
 
     -- response

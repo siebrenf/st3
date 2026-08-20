@@ -183,11 +183,13 @@ class Supervisor:
         self.uuid2role = {}
         self.uuid2heartbeat = {}
         self.role2uuids = {}
-        ret = self.conn.execute("""
+        ret = self.conn.execute(
+            """
             SELECT uuid, role, heartbeat_at 
             FROM backend.processes 
             WHERE stopped_at IS NULL
-            """).fetchall()
+            """
+        ).fetchall()
         for uuid, role, heartbeat in ret:
             uuid = str(uuid)
             if uuid == self.uuid:

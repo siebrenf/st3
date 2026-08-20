@@ -26,22 +26,25 @@ class Messenger:
         while self.running:
             self.heartbeat()
 
-            api_request = self.conn.execute("""
+            api_request = self.conn.execute(
+                """
                 SELECT
                     r.*,
                     a.token
                 FROM backend.api_requests AS r
                 LEFT JOIN game.agents AS a ON a.symbol = r.agent
-                WHERE r.completed = false
+                WHERE r.requested_at IS NULL
                 ORDER BY r.priority DESC, r.id ASC
                 LIMIT 1;
-                """).fetchone()
+                """
+            ).fetchone()
             if api_request is None:
                 # sleep until notified or timeout
-                for _ in self.conn.notifies(timeout=10):
+                for _ in self.conn.notifies(timeout=10, stop_after=1):
                     break
                 continue
 
+            t = time.now()
             ret = self.request(
                 method=api_request["method"],
                 endpoint=api_request["endpoint"],
@@ -57,19 +60,20 @@ class Messenger:
                 """
                 UPDATE backend.api_requests
                 SET 
-                    completed = true,
-                    completed_at = now(),
+                    requested_at = %s,
                     response_status = %s,
                     response_headers = %s,
                     response_json = %s
                 WHERE id = %s
                 """,
-                (ret.status_code, ret.headers, ret.json(), api_request["id"]),
+                (t, ret.status_code, ret.headers, ret.json(), api_request["id"]),
             )
-            self.conn.execute(
-                "SELECT pg_notify('api_response', %s)",
-                (str(api_request["id"]),),
-            )
+            # TODO: generic or specific notify?
+            # self.conn.execute(
+            #     "SELECT pg_notify('api_response', %s)",
+            #     (str(api_request["id"]),),
+            # )
+            self.conn.execute("NOTIFY work_available")
             self.conn.commit()
 
         self.deregister()
@@ -98,7 +102,7 @@ class Messenger:
         )
         self.conn.commit()
 
-    def shutdown(self, signum, frame):
+    def shutdown(self, signum, frame):  # noqa
         self.running = False
 
     def heartbeat(self):
