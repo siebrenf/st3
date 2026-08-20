@@ -21,16 +21,12 @@ class Supervisor:
     """
 
     session = None
-    processes = {}  # uuid: psutil.Process(pid)
-    role2uuids = {
-        "directors": [],
-        "messengers": [],
-        "workers": [],
-    }
-    uuid2role = {}  # uuid: role
+    uuid2processes = {}  # uuid: psutil.Process(pid)
+    uuid2role = {}
+    uuid2heartbeat = {}
+    role2uuids = {}
 
     uuid = None
-    pid = None
     _lock = None
     start_time = None  # updated on reset
     conn = None
@@ -42,7 +38,7 @@ class Supervisor:
             with connect(f"dbname={self.session} user=postgres") as self.conn:
                 self.heartbeat()
 
-                processes_requested, heartbeats, reset, shutdown = self.read_db()
+                processes_requested, reset, shutdown = self.read_db()
 
                 if reset:
                     self.reset()
@@ -52,7 +48,7 @@ class Supervisor:
                     self.shutdown()
                     break
 
-                self.clean_dead_processes(heartbeats, heartbeat_timeout)
+                self.clean_dead_processes(heartbeat_timeout)
 
                 if dev_mode:
                     # TODO: file watching
@@ -77,10 +73,36 @@ class Supervisor:
         self.clean_old_processes()
 
         # register supervisor process
-        self.pid = getpid()
         self.uuid = str(uuid1())
         self.start_time = time.now()
         self.register()
+
+    def lock_acquire(self):
+        self._lock = open(Path(DATA_DIR) / "supervisor.lock", "w")
+        try:
+            fcntl.flock(
+                self._lock,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError:
+            self._lock.close()
+            self._lock = None
+            raise RuntimeError("Supervisor already running")
+
+    def lock_release(self):
+        if self._lock is not None:
+            fcntl.flock(self._lock, fcntl.LOCK_UN)
+            self._lock.close()
+            self._lock = None
+
+    def start_db(self):
+        while True:
+            try:
+                self.session = DataBase().session
+            except RuntimeError as e:
+                # game server might be between resets
+                logger.warning(str(e))
+                time.sleep(60)
 
     def clean_old_processes(self):
         with connect(f"dbname={self.session} user=postgres") as conn:
@@ -117,74 +139,8 @@ class Supervisor:
                 (uuid, pid, role, started_at)
                 VALUES (%s, %s, %s, %s)
                 """,
-                (self.uuid, self.pid, "supervisor", self.start_time),
+                (self.uuid, getpid(), "supervisor", self.start_time),
             )
-
-    def shutdown(self):
-        self.log_event("Shutting down")
-        draining_processes = []
-        for role in ["directors", "workers", "messenger"]:
-            for uuid in self.role2uuids[role]:
-                draining_processes.append(self.stop(uuid))
-        for p in draining_processes:
-            p.wait()
-        self.conn.execute(
-            """
-            UPDATE backend.processes
-            SET stopped_at = now()
-            WHERE uuid = %s
-            """,
-            (self.uuid,),
-        )
-        self.conn.execute("NOTIFY supervisor")
-        self.conn.commit()
-        self.lock_release()
-
-    def reset(self):
-        self.log_event("Resetting")
-        draining_processes = []
-        for uuid in self.processes:
-            draining_processes.append(self.stop(uuid))
-        for p in draining_processes:
-            p.wait()
-        self.conn.execute("NOTIFY supervisor")
-        self.conn.commit()
-
-        # start the SQL server + session DB + DB tables
-        old_session = self.session.copy()
-        self.start_db()
-        self.start_time = time.now()
-        new_session = self.session.copy()
-        if old_session != new_session:
-            # a game restart occurred (and new DB was created)
-            self.register()
-
-    def lock_acquire(self):
-        self._lock = open(Path(DATA_DIR) / "supervisor.lock", "w")
-        try:
-            fcntl.flock(
-                self._lock,
-                fcntl.LOCK_EX | fcntl.LOCK_NB,
-            )
-        except BlockingIOError:
-            self._lock.close()
-            self._lock = None
-            raise RuntimeError("Supervisor already running")
-
-    def lock_release(self):
-        if self._lock is not None:
-            fcntl.flock(self._lock, fcntl.LOCK_UN)
-            self._lock.close()
-            self._lock = None
-
-    def start_db(self):
-        while True:
-            try:
-                self.session = DataBase().session
-            except RuntimeError as e:
-                # game server might be between resets
-                logger.warning(str(e))
-                time.sleep(60)
 
     def heartbeat(self):
         self.conn.execute(
@@ -194,9 +150,7 @@ class Supervisor:
         self.conn.commit()
 
     def read_db(self):
-        processes_requested = {
-            "messengers": 1,
-        }
+        processes_requested = {"messengers": 1}
 
         n = len(
             self.conn.execute(
@@ -220,37 +174,74 @@ class Supervisor:
             else:
                 raise ValueError(f"{k}: {v}")
 
-        heartbeats = {}
+        self.uuid2role = {}
+        self.uuid2heartbeat = {}
+        self.role2uuids = {}
         ret = self.conn.execute(
             """
-            SELECT uuid, heartbeat_at FROM backend.processes WHERE stopped_at IS NULL
-            """,
-            (None,),
-        ).fetchall()
-        for uuid, heartbeat in ret:
-            heartbeats[uuid] = heartbeat
-
-        return processes_requested, heartbeats, reset, shutdown
-
-    def update_roles_and_uuids(self):
-        ret = self.conn.execute(
-            """
-            SELECT uid, role FROM backend.processes
+            SELECT uuid, role, heartbeat_at 
+            FROM backend.processes 
             WHERE stopped_at IS NULL
-            ORDER BY started_at ASC
             """
         ).fetchall()
-        for uuid, role in ret:
-            if uuid not in self.role2uuids[role]:
-                self.role2uuids[role].append(uuid)
+        for uuid, role, heartbeat in ret:
+            uuid = str(uuid)
+            if uuid == self.uuid:
+                continue
+            if uuid not in self.uuid2processes:
+                raise NotImplementedError(f"Unknown process in DB: {role=} {uuid=}")
+            self.uuid2role[uuid] = role
+            self.uuid2heartbeat[uuid] = heartbeat
+            self.role2uuids.setdefault(role, []).append(uuid)
+        if len(self.uuid2processes) != len(self.uuid2role):
+            raise NotImplementedError(
+                f"{list(self.uuid2processes)} != {list(self.uuid2role)}"
+            )
 
-        for role, uuids in self.role2uuids.items():
-            for uuid in uuids:
-                self.uuid2role[uuid] = role
+        return processes_requested, reset, shutdown
 
-    def clean_dead_processes(self, heartbeats, heartbeat_timeout):
+    def reset(self):
+        self.log_event("Resetting")
         draining_processes = []
-        for uuid, role in self.yield_dead_processes(heartbeats, heartbeat_timeout):
+        for uuid in list(self.uuid2processes):
+            draining_processes.append(self.stop(uuid))
+        for p in draining_processes:
+            p.wait()
+        self.conn.execute("NOTIFY supervisor")
+        self.conn.commit()
+
+        # start the SQL server + session DB + DB tables
+        old_session = self.session.copy()
+        self.start_db()
+        self.start_time = time.now()
+        new_session = self.session.copy()
+        if old_session != new_session:
+            # a game restart occurred (and new DB was created)
+            self.register()
+
+    def shutdown(self):
+        self.log_event("Shutting down")
+        draining_processes = []
+        for role in ["directors", "workers", "messenger"]:
+            for uuid in list(self.role2uuids[role]):
+                draining_processes.append(self.stop(uuid))
+        for p in draining_processes:
+            p.wait()
+        self.conn.execute(
+            """
+            UPDATE backend.processes
+            SET stopped_at = now()
+            WHERE uuid = %s
+            """,
+            (self.uuid,),
+        )
+        self.conn.execute("NOTIFY supervisor")
+        self.conn.commit()
+        self.lock_release()
+
+    def clean_dead_processes(self, heartbeat_timeout):
+        draining_processes = []
+        for uuid, role in self.yield_dead_processes(heartbeat_timeout):
             draining_processes.append(self.stop(uuid, role))
         for p in draining_processes:
             try:
@@ -259,28 +250,29 @@ class Supervisor:
                 p.kill()
                 p.wait()
 
-    def yield_dead_processes(self, hbs, timeout):
-        # TODO: use PIDs from DB instead of local dict?
-        for uuid in list(self.processes):
-            # if not psutil.pid_exists(pid):
-            #     self.log_event(f"Crashed: {role} process with {uuid=}", "error")
-            #     # no process left to stop
-            #     self.conn.execute(
-            #         """
-            #         UPDATE backend.processes
-            #         SET stopped_at = now()
-            #         WHERE uuid = %s
-            #           AND stopped_at IS NULL
-            #         """,
-            #         (uuid,),
-            #     )
-            #     self.conn.commit()
-            #     del self.processes[uuid]
-            #     self.role2uuids[role].remove(uuid)
-            #     del self.uuid2role[uuid]
-            #     continue
-            if (time.now() - hbs[uuid]).seconds >= timeout:
-                role = self.uuid2role[uuid]
+    def yield_dead_processes(self, timeout):
+        for uuid in list(self.uuid2processes):
+            role = self.uuid2role[uuid]
+            if not self.uuid2processes[uuid].is_running():
+                self.log_event(f"Crashed: {role} process with {uuid=}", "error")
+                # no process left to stop
+                self.conn.execute(
+                    """
+                    UPDATE backend.processes
+                    SET stopped_at = now()
+                    WHERE uuid = %s
+                      AND stopped_at IS NULL
+                    """,
+                    (uuid,),
+                )
+                self.conn.commit()
+                del self.uuid2processes[uuid]
+                del self.uuid2role[role]
+                del self.uuid2heartbeat[role]
+                self.role2uuids[role].remove(uuid)
+                continue
+            hb = self.uuid2heartbeat[uuid]
+            if (time.now() - hb).seconds >= timeout:
                 self.log_event(f"Timeout: {role} process with {uuid=}", "error")
                 yield uuid, role
                 continue
@@ -292,9 +284,7 @@ class Supervisor:
         p = psutil.Process(pid)
         # start measuring CPU usage
         _ = p.cpu_percent()
-        self.processes[uuid] = p
-        self.role2uuids[role].append(uuid)
-        self.uuid2role[uuid] = role
+        self.uuid2processes[uuid] = p
 
     def stop(self, uuid: str = None, role: str = None):
         if uuid is None and role is None:
@@ -305,11 +295,12 @@ class Supervisor:
             # kills the oldest process first
             uuid = self.role2uuids[role][0]
         self.log_event(f"Stopping {role} process with {uuid=}")
-        p = self.processes[uuid]
+        p = self.uuid2processes[uuid]
         p.terminate()
-        del self.processes[uuid]
+        del self.uuid2processes[uuid]
+        del self.uuid2role[role]
+        del self.uuid2heartbeat[role]
         self.role2uuids[role].remove(uuid)
-        del self.uuid2role[uuid]
         return p
 
     def cpu_usage(self, processes_requested):
@@ -317,7 +308,7 @@ class Supervisor:
         pcts = []
         n = len(self.role2uuids["workers"])
         for uuid in self.role2uuids["workers"]:
-            p = self.processes[uuid]
+            p = self.uuid2processes[uuid]
             pcts.append(p.cpu_percent())
         if sum(pcts) / n > 0.9:
             modifier += 1
@@ -325,7 +316,7 @@ class Supervisor:
             modifier -= 1
 
         # only change the number of workers after a grace period
-        if modifier != 0 and (time.now() - self.start_time).seconds > 300:
+        if modifier != 0 and (time.now() - self.start_time).seconds > 120:
             processes_requested["workers"] += modifier
             self.conn.execute(
                 """
