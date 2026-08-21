@@ -7,7 +7,6 @@ from psycopg.rows import dict_row
 
 from st3 import time
 from st3.db.utils import get_session
-from st3.request import Request
 
 # class RequestDB:
 #     def __init__(self, session):
@@ -111,7 +110,8 @@ class Worker:
     def __init__(self, uuid):
         self.uuid = uuid
         self.session = get_session()
-        # self.request = Request()
+        self.heartbeat_cooldown = 10
+        self.heartbeat_at = time.now()
         self.conn = connect(
             f"dbname={self.session} user=postgres", row_factory=dict_row
         )
@@ -121,36 +121,64 @@ class Worker:
         self.running = True
         signal.signal(signal.SIGTERM, self.shutdown)
         while self.running:
+            sleep = True
+
             self.heartbeat()
 
-            work = self.available_work()  # TODO
-            if work is None:
-                # sleep until notified
-                for _ in self.conn.notifies(timeout=None, stop_after=1):
+            # process an API response
+            api_response = self.get_api_response()
+            if api_response is not None:
+                # update game state
+                self.update_game(api_response)
+                # mark request as completed
+                self.update_api_requests(api_response)
+                # mark action as completed
+                plan_id, cooldown = self.update_action(api_response=api_response)
+                # mark plan progress
+                goal_id = self.update_plan(plan_id, cooldown)
+                # mark goal ready for review
+                self.update_goal(goal_id)
+                self.conn.commit()
+                sleep = False
+
+            # process an action
+            action = self.get_action()
+            if action is not None:
+                # 1 action = 1 API request
+                self.queue_api_requests(action)
+                # mark action progress
+                self.update_action(action=action)
+                self.conn.commit()
+                sleep = False
+
+            # process a goal
+            goal = self.get_goal()
+            if goal is not None:
+                # 1 goal >= 0 subgoals
+                subgoals = self.formulate_subgoals(goal)
+                if subgoals:
+                    for subgoal in subgoals:
+                        self.queue_goal(subgoal)
+                    # mark goal progress
+                    self.update_goal(goal, subgoals=subgoals)
+
+                # 1 goal >= 0 plans
+                plans = self.formulate_plans(goal)
+                if plans:
+                    for plan in plans:
+                        self.queue_plan(plan)
+                        # 1 plan >= 1 actions
+                        self.queue_actions(plan)
+                        # mark goal progress
+                        self.update_goal(goal, plans=plans)
+
+                self.conn.commit()
+                sleep = False
+
+            if sleep:
+                # sleep until notified or timeout
+                for _ in self.conn.notifies(timeout=10):
                     continue
-
-            # TODO: use work
-            pass
-
-            # - listen (with timeout)
-            # - option 1:
-            #     - read available plan
-            #     - CPU heavy: convert plan into route with steps
-            #       (navigate, refuel, repair, buy cargo, sell cargo, jettison cargo, supply, deliver, market, shipyard)
-            #     - write route to routes + heartbeat
-            # - option 2:
-            #     - read available steps of currently ready task
-            #     - write api requests to queue + heartbeat
-            # - option 3:
-            #     - read available steps of currently ready task
-            #     - parse API response
-            #     - write response to game state + update route + heartbeat
-            #     - continue with option 2 if possible
-            # - option 4:
-            #     - read available steps of currently ready task
-            #     - CPU heavy: review options
-            #     - update route + heartbeat
-            #     - continue with option 2 if possible
 
         self.deregister()
         self.conn.close()
@@ -164,8 +192,7 @@ class Worker:
             """,
             (self.uuid, getpid(), "worker"),
         )
-        # self.conn.execute("LISTEN api_queue")  TODO: where to listen to?
-        self.conn.execute("LISTEN work_available")  # TODO
+        self.conn.execute("LISTEN work")
         self.conn.commit()
 
     def deregister(self):
@@ -183,50 +210,113 @@ class Worker:
         self.running = False
 
     def heartbeat(self):
-        self.conn.execute(
-            """UPDATE backend.processes SET heartbeat_at = now() WHERE uuid = %s""",
-            (self.uuid,),
-        )
-        self.conn.commit()
+        t = time.now()
+        if t > self.heartbeat_at + self.heartbeat_cooldown:
+            self.conn.execute(
+                """UPDATE backend.processes SET heartbeat_at = now() WHERE uuid = %s""",
+                (self.uuid,),
+            )
+            self.conn.commit()
+            self.heartbeat_at = t
 
-    def available_work(self):
+    def get_api_response(self):
         return self.conn.execute(
             """
             SELECT *
-            FROM (
-                SELECT
-                    id,
-                    'api_request' AS work_type,
-                    1 AS priority
-                FROM backend.api_requests
-                WHERE requested_at IS NOT NULL
-                  AND completed_at IS NULL
-                ORDER BY priority DESC, id ASC
-                LIMIT 1
-
-                UNION ALL
-
-                SELECT
-                    id,
-                    'table2' AS work_type,
-                    2 AS priority
-                FROM table2
-                WHERE processed = false
-
-                UNION ALL
-
-                SELECT
-                    id,
-                    'table3' AS work_type,
-                    3 AS priority
-                FROM table3
-                WHERE processed = false
-            ) AS work
-            ORDER BY priority
+            FROM backend.api_requests
+            WHERE requested_at IS NOT NULL
+              AND completed_at IS NULL
+            ORDER BY priority DESC, created_at ASC
             LIMIT 1
             """
         ).fetchone()
 
+    def get_action(self, action_id=None):
+        if action_id is not None:
+            action = self.conn.execute(
+                """
+                SELECT *
+                FROM backend.actions
+                WHERE is = %s
+                """,
+                (action_id, )
+            ).fetchone()
+        else:
+            action = self.conn.execute(
+                """
+                SELECT *
+                FROM backend.actions
+                WHERE ready_at <= now()
+                ORDER BY priority DESC, created_at ASC
+                LIMIT 1
+                """
+            ).fetchone()
+        return action
+
+    def update_game(self, api_response):
+        pass
+
+    def update_action(self, api_response=None, action=None):
+        now = time.now()
+        # action completed
+        if api_response:
+            # TODO: get all relevant cooldowns
+            plan_id = self.conn.execute(
+                """
+                UPDATE backend.actions 
+                SET
+                    completed_at = %s
+                WHERE id = %s
+                RETURNING plan_id
+                """,
+                (now, api_response["action_id"],)
+            ).fetchone()[0]
+            cd = api_response["response_json"]["data"].get("cooldown", now)
+            if time.remaining(cd) == 0:
+                return plan_id
+        # action accepted
+        if action:
+            self.conn.execute(
+                """
+                UPDATE backend.actions 
+                SET
+                    accepted_at = %s
+                WHERE id = %s
+                """,
+                (now, action["id"],)
+            ).fetchone()
+        return None
+
+    def update_plan(self, plan_id, cooldown):
+        # mark plan progress + get next_action_id
+        # TODO: how to link actions together?
+        # TODO: how to wait for the last action to be completed (including cooldown)?
+        next_action_id = None
+        if next_action_id:
+            # set next action ready_at
+            self.conn.execute(
+                """
+                UPDATE backend.actions
+                SET
+                    ready_at = %s
+                WHERE id = %s
+                """,
+                (cooldown, next_action_id)
+            )
+        else:
+            # mark plan completed and return goal_id
+            goal_id = self.conn.execute(
+                """
+                UPDATE backend.plans
+                SET
+                    completed_at = %s
+                WHERE id = %s
+                RETURNING goal_id
+                """,
+                (cooldown, plan_id)
+            ).fetchone()[0]
+            return goal_id
+        return None
 
 if __name__ == "__main__":
     m = Worker(uuid=argv[1])

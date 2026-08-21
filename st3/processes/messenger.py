@@ -14,6 +14,8 @@ class Messenger:
     def __init__(self, uuid):
         self.uuid = uuid
         self.session, self.next_reset = get_session(True)
+        self.heartbeat_cooldown = 10
+        self.heartbeat_at = time.now()
         self.request = Request()
         self.conn = connect(
             f"dbname={self.session} user=postgres", row_factory=dict_row
@@ -34,7 +36,7 @@ class Messenger:
                 FROM backend.api_requests AS r
                 LEFT JOIN game.agents AS a ON a.symbol = r.agent
                 WHERE r.requested_at IS NULL
-                ORDER BY r.priority DESC, r.id ASC
+                ORDER BY r.priority DESC, r.created_at ASC
                 LIMIT 1;
                 """
             ).fetchone()
@@ -68,12 +70,7 @@ class Messenger:
                 """,
                 (t, ret.status_code, ret.headers, ret.json(), api_request["id"]),
             )
-            # TODO: generic or specific notify?
-            # self.conn.execute(
-            #     "SELECT pg_notify('api_response', %s)",
-            #     (str(api_request["id"]),),
-            # )
-            self.conn.execute("NOTIFY work_available")
+            self.conn.execute("NOTIFY work")
             self.conn.commit()
 
         self.deregister()
@@ -106,11 +103,14 @@ class Messenger:
         self.running = False
 
     def heartbeat(self):
-        self.conn.execute(
-            """UPDATE backend.processes SET heartbeat_at = now() WHERE uuid = %s""",
-            (self.uuid,),
-        )
-        self.conn.commit()
+        t = time.now()
+        if t > self.heartbeat_at + self.heartbeat_cooldown:
+            self.conn.execute(
+                """UPDATE backend.processes SET heartbeat_at = now() WHERE uuid = %s""",
+                (self.uuid,),
+            )
+            self.conn.commit()
+            self.heartbeat_at = t
 
     def server_reset(self, api_request, response):
         """
